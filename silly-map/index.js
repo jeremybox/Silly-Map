@@ -150,6 +150,12 @@ jQuery(async () => {
                         <span>Inject scene into chat</span>
                     </label>
                     <span class="dnd-ui-hint">Add descriptions of objects and characters to the generation context.</span>
+                    <hr class="dnd-ui-divider">
+                    <label class="dnd-settings-checkbox" for="dnd-auto-update-locs-toggle">
+                        <input type="checkbox" id="dnd-auto-update-locs-toggle" class="checkbox">
+                        <span>Auto-update locations every turn</span>
+                    </label>
+                    <span class="dnd-ui-hint">After each message, AI picks and activates the location that fits the story.</span>
                 </div>
             </div>
 
@@ -207,6 +213,7 @@ jQuery(async () => {
     const SETTINGS_KEY = "dnd_vtt_settings";
     let extSettings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
     if (typeof extSettings.injectSceneContext === 'undefined') extSettings.injectSceneContext = true;
+    if (typeof extSettings.autoUpdateLocations === 'undefined') extSettings.autoUpdateLocations = false;
 
     // --- СТАН ВІДКРИТТЯ МАПИ (per chat, persistent) ---
     function mapOpenStorageKey(chatId) {
@@ -260,6 +267,7 @@ jQuery(async () => {
         $("#dnd-ai-model-input").val(extSettings.aiModel || "");
         // За замовчуванням інжект увімкнено (true), якщо явно не вимкнено (false).
         $("#dnd-inject-scene-toggle").prop("checked", extSettings.injectSceneContext !== false);
+        $("#dnd-auto-update-locs-toggle").prop("checked", !!extSettings.autoUpdateLocations);
         updateCurrentModelDisplay();
     }
     updateCurrentModelDisplay();
@@ -293,6 +301,12 @@ jQuery(async () => {
         extSettings.injectSceneContext = $("#dnd-inject-scene-toggle").prop("checked");
         persistSettings();
         toast.info(extSettings.injectSceneContext ? "Scene injection enabled" : "Scene injection disabled");
+    });
+
+    $(document).on("change", "#dnd-auto-update-locs-toggle", () => {
+        extSettings.autoUpdateLocations = $("#dnd-auto-update-locs-toggle").prop("checked");
+        persistSettings();
+        toast.info(extSettings.autoUpdateLocations ? "Auto-update locations enabled" : "Auto-update locations disabled");
     });
 
     // =========================================================
@@ -1664,11 +1678,11 @@ jQuery(async () => {
         return ctx.join("\n\n") || "(There are no posts yet)";
     }
 
-    $(document).on("click", "#dnd-ai-generate-loc-btn", async function() {
-        if (installedLocIds.length === 0) return;
-        const $btn = $(this);
-        const orig = $btn.html();
-        $btn.prop("disabled", true).html(`${ICONS.refresh} Thinking...`);
+    async function aiPickLocationByStory({ silent = false } = {}) {
+        if (installedLocIds.length === 0) {
+            if (!silent) toast.warning("No locations installed.");
+            return null;
+        }
         const context = getRecentChatContext(5);
         const locsData = installedLocIds.map(id => {
             const l = getLocInfo(id);
@@ -1684,19 +1698,31 @@ ${context}
 
 Output ONLY the exact ID of the chosen location, nothing else.`;
 
+        const response = await callAIDirector(prompt);
+        let chosenId = null;
+        const text = response || "";
+        for (const id of installedLocIds) {
+            if (text.includes(id)) { chosenId = id; break; }
+        }
+        if (!chosenId) {
+            if (!silent) toast.error("AI could not pick a location.");
+            return null;
+        }
+        console.log(`[Silly Map AI] Chosen Location ID: ${chosenId}`);
+        // Auto mode: if already active, leave the user's current view alone.
+        if (silent && gameState.activeLocations[chosenId]) {
+            return chosenId;
+        }
+        await activateLocation(chosenId);
+        return chosenId;
+    }
+
+    $(document).on("click", "#dnd-ai-generate-loc-btn", async function() {
+        const $btn = $(this);
+        const orig = $btn.html();
+        $btn.prop("disabled", true).html(`${ICONS.refresh} Thinking...`);
         try {
-            const response = await callAIDirector(prompt);
-            let chosenId = null;
-            const text = response || "";
-            for (const id of installedLocIds) {
-                if (text.includes(id)) { chosenId = id; break; }
-            }
-            if (chosenId) {
-                console.log(`[Silly Map AI] Chosen Location ID: ${chosenId}`);
-                await activateLocation(chosenId);
-            } else {
-                toast.error("AI could not pick a location.");
-            }
+            await aiPickLocationByStory({ silent: false });
         } catch (err) {
             console.error("[Silly Map AI] API Error:", err);
             toast.error("Error requesting AI.");
@@ -2440,6 +2466,28 @@ Example of expected JSON output:
             }
         } else if (isMapVisible) {
             closeMap();
+        }
+    });
+
+    // Auto-update location after each character message (turn)
+    let autoUpdateLocationsInProgress = false;
+    eventSource.on(event_types.MESSAGE_RECEIVED, async (_messageId, type) => {
+        if (type === "user") return;
+        if (!extSettings.autoUpdateLocations) return;
+        if (!currentChatId) return;
+        if (isAIDirectorBusy || autoUpdateLocationsInProgress) return;
+        if (installedLocIds.length === 0) {
+            await loadInstalledLocations();
+            if (installedLocIds.length === 0) return;
+        }
+
+        autoUpdateLocationsInProgress = true;
+        try {
+            await aiPickLocationByStory({ silent: true });
+        } catch (err) {
+            console.error("[Silly Map AI] Auto-update locations error:", err);
+        } finally {
+            autoUpdateLocationsInProgress = false;
         }
     });
 
